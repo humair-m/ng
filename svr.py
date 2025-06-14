@@ -712,9 +712,407 @@ async def upload_image(
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="Empty file not allowed")
     
-    # Generate unique filename
+   # Generate unique filename
     file_id = str(uuid.uuid4())
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     extension = Path(file.filename).suffix
     safe_original_name = re.sub(r'[^\w\-_\.]', '_', file.filename)  # Sanitize filename
-    filename = f"{timestamp}_{file_id}_{
+    filename = f"{timestamp}_{file_id}_{safe_original_name}"
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    
+    try:
+        # Save file
+        with open(filepath, "wb") as f:
+            f.write(content)
+        
+        # Get file info
+        file_size = len(content)
+        file_hash = get_file_hash(filepath)
+        mime_type = mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
+        upload_time = datetime.now().isoformat()
+        
+        file_info = {
+            "filename": filename,
+            "original_name": file.filename,
+            "size": file_size,
+            "upload_time": upload_time,
+            "file_hash": file_hash,
+            "mime_type": mime_type
+        }
+        
+        # Update stats
+        upload_stats["total_uploads"] += 1
+        upload_stats["total_size"] += file_size
+        upload_stats["last_upload"] = upload_time
+        
+        logger.info(f"✅ File uploaded successfully: {filename} ({file_size} bytes)")
+        
+        # Prepare response
+        response_data = {
+            "status": "success",
+            "filename": filename,
+            "file_id": file_id,
+            "size": file_size,
+            "upload_time": upload_time,
+            "analysis_status": "pending" if analyze else "disabled",
+            "analysis_result": None
+        }
+        
+        # Start AI analysis if requested
+        if analyze:
+            background_tasks.add_task(process_image_analysis, filepath, filename, file_info)
+            logger.info(f"🎯 AI analysis queued for: {filename}")
+        
+        return UploadResponse(**response_data)
+        
+    except Exception as e:
+        # Clean up file if it was created
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+                logger.info(f"🧹 Cleaned up failed upload: {filepath}")
+            except Exception as cleanup_error:
+                logger.error(f"❌ Failed to cleanup file {filepath}: {cleanup_error}")
+        
+        logger.error(f"❌ Error saving file {file.filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error saving file: {str(e)}")
+
+@app.get("/files", response_model=List[FileInfo])
+async def list_files(x_api_key: str = Header(None)):
+    """List all uploaded files with their information"""
+    verify_api_key(x_api_key)
+    
+    try:
+        files = []
+        for filename in os.listdir(UPLOAD_FOLDER):
+            filepath = os.path.join(UPLOAD_FOLDER, filename)
+            if os.path.isfile(filepath):
+                try:
+                    stat = os.stat(filepath)
+                    file_info = FileInfo(
+                        filename=filename,
+                        original_name=filename.split('_', 2)[-1] if '_' in filename else filename,
+                        size=stat.st_size,
+                        upload_time=datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                        file_hash=get_file_hash(filepath),
+                        mime_type=mimetypes.guess_type(filename)[0] or "application/octet-stream",
+                        analysis_status="completed" if filename in analysis_results else "unknown",
+                        analysis_result=analysis_results.get(filename)
+                    )
+                    files.append(file_info)
+                except Exception as e:
+                    logger.error(f"❌ Error getting file info for {filename}: {e}")
+                    continue
+        
+        files.sort(key=lambda x: x.upload_time, reverse=True)
+        logger.info(f"📋 Listed {len(files)} files")
+        return files
+        
+    except Exception as e:
+        logger.error(f"❌ Error listing files: {e}")
+        raise HTTPException(status_code=500, detail="Error listing files")
+
+@app.get("/files/{filename}")
+async def download_file(filename: str, x_api_key: str = Header(None)):
+    """Download a specific file"""
+    verify_api_key(x_api_key)
+    
+    # Sanitize filename to prevent directory traversal
+    safe_filename = os.path.basename(filename)
+    filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
+    
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    try:
+        return FileResponse(
+            path=filepath,
+            filename=safe_filename,
+            media_type=mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
+        )
+    except Exception as e:
+        logger.error(f"❌ Error downloading file {filename}: {e}")
+        raise HTTPException(status_code=500, detail="Error downloading file")
+
+@app.delete("/files/{filename}")
+async def delete_file(filename: str, x_api_key: str = Header(None)):
+    """Delete a specific file and its analysis"""
+    verify_api_key(x_api_key)
+    
+    # Sanitize filename
+    safe_filename = os.path.basename(filename)
+    filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
+    
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    try:
+        # Get file size before deletion for stats
+        file_size = os.path.getsize(filepath)
+        
+        # Delete main file
+        os.remove(filepath)
+        
+        # Delete analysis file if exists
+        analysis_filename = f"{Path(safe_filename).stem}_analysis.json"
+        analysis_filepath = os.path.join(ANALYSIS_FOLDER, analysis_filename)
+        if os.path.exists(analysis_filepath):
+            os.remove(analysis_filepath)
+        
+        # Remove from memory cache
+        if safe_filename in analysis_results:
+            del analysis_results[safe_filename]
+        
+        # Update stats
+        upload_stats["total_size"] = max(0, upload_stats["total_size"] - file_size)
+        
+        logger.info(f"🗑️ File deleted: {safe_filename}")
+        return {"status": "success", "message": f"File {safe_filename} deleted successfully"}
+        
+    except Exception as e:
+        logger.error(f"❌ Error deleting file {filename}: {e}")
+        raise HTTPException(status_code=500, detail="Error deleting file")
+
+@app.get("/analyses/{filename}", response_model=AnalysisResponse)
+async def get_analysis(filename: str, x_api_key: str = Header(None)):
+    """Get AI analysis result for a specific file"""
+    verify_api_key(x_api_key)
+    
+    # Sanitize filename
+    safe_filename = os.path.basename(filename)
+    
+    # Check memory cache first
+    if safe_filename in analysis_results:
+        result = analysis_results[safe_filename]
+        return AnalysisResponse(
+            status=result["status"],
+            filename=safe_filename,
+            analysis=result,
+            analysis_time=result.get("analysis_time", "")
+        )
+    
+    # Check file system
+    analysis_filename = f"{Path(safe_filename).stem}_analysis.json"
+    analysis_filepath = os.path.join(ANALYSIS_FOLDER, analysis_filename)
+    
+    if not os.path.exists(analysis_filepath):
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    
+    try:
+        with open(analysis_filepath, "r", encoding='utf-8') as f:
+            analysis_data = json.load(f)
+        
+        result = analysis_data.get("analysis_result", {})
+        return AnalysisResponse(
+            status=result.get("status", "unknown"),
+            filename=safe_filename,
+            analysis=result,
+            analysis_time=result.get("analysis_time", "")
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Error reading analysis for {filename}: {e}")
+        raise HTTPException(status_code=500, detail="Error reading analysis")
+
+@app.get("/analyses", response_model=List[Dict[str, Any]])
+async def list_analyses(x_api_key: str = Header(None)):
+    """List all analysis results"""
+    verify_api_key(x_api_key)
+    
+    try:
+        analyses = []
+        
+        # Get from memory cache
+        for filename, result in analysis_results.items():
+            analyses.append({
+                "filename": filename,
+                "status": result.get("status", "unknown"),
+                "analysis_time": result.get("analysis_time", ""),
+                "model_used": result.get("model_used", "unknown")
+            })
+        
+        # Also check master file
+        master_file = os.path.join(ANALYSIS_FOLDER, "all_analyses.json")
+        if os.path.exists(master_file):
+            try:
+                with open(master_file, "r", encoding='utf-8') as f:
+                    file_analyses = json.load(f)
+                
+                for analysis in file_analyses:
+                    filename = analysis.get("filename", "unknown")
+                    result = analysis.get("analysis_result", {})
+                    
+                    # Avoid duplicates from memory cache
+                    if not any(a["filename"] == filename for a in analyses):
+                        analyses.append({
+                            "filename": filename,
+                            "status": result.get("status", "unknown"),
+                            "analysis_time": result.get("analysis_time", ""),
+                            "model_used": result.get("model_used", "unknown")
+                        })
+                        
+            except Exception as e:
+                logger.warning(f"⚠️ Error reading master analysis file: {e}")
+        
+        analyses.sort(key=lambda x: x.get("analysis_time", ""), reverse=True)
+        logger.info(f"📊 Listed {len(analyses)} analyses")
+        return analyses
+        
+    except Exception as e:
+        logger.error(f"❌ Error listing analyses: {e}")
+        raise HTTPException(status_code=500, detail="Error listing analyses")
+
+@app.get("/stats", response_model=StatsResponse)
+async def get_stats(x_api_key: str = Header(None)):
+    """Get comprehensive server statistics"""
+    verify_api_key(x_api_key)
+    
+    try:
+        # Count files and calculate stats
+        total_files = 0
+        total_size = 0
+        file_types = {}
+        oldest_file = None
+        newest_file = None
+        oldest_time = None
+        newest_time = None
+        
+        if os.path.exists(UPLOAD_FOLDER):
+            for filename in os.listdir(UPLOAD_FOLDER):
+                filepath = os.path.join(UPLOAD_FOLDER, filename)
+                if os.path.isfile(filepath):
+                    total_files += 1
+                    
+                    # File size
+                    try:
+                        size = os.path.getsize(filepath)
+                        total_size += size
+                    except Exception:
+                        continue
+                    
+                    # File type
+                    ext = Path(filename).suffix.lower()
+                    file_types[ext] = file_types.get(ext, 0) + 1
+                    
+                    # File dates
+                    try:
+                        mtime = os.path.getmtime(filepath)
+                        if oldest_time is None or mtime < oldest_time:
+                            oldest_time = mtime
+                            oldest_file = filename
+                        if newest_time is None or mtime > newest_time:
+                            newest_time = mtime
+                            newest_file = filename
+                    except Exception:
+                        continue
+        
+        upload_folder_size = get_folder_size(UPLOAD_FOLDER)
+        
+        return StatsResponse(
+            total_files=total_files,
+            total_size=total_size,
+            upload_folder_size=upload_folder_size,
+            analyzed_files=upload_stats["analyzed_files"],
+            pending_analysis=upload_stats["pending_analysis"],
+            failed_analysis=upload_stats["failed_analysis"],
+            oldest_file=oldest_file,
+            newest_file=newest_file,
+            file_types=file_types
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting stats: {e}")
+        raise HTTPException(status_code=500, detail="Error getting statistics")
+
+@app.post("/reanalyze/{filename}")
+async def reanalyze_file(
+    filename: str, 
+    background_tasks: BackgroundTasks,
+    x_api_key: str = Header(None)
+):
+    """Re-run AI analysis on an existing file"""
+    verify_api_key(x_api_key)
+    
+    # Sanitize filename
+    safe_filename = os.path.basename(filename)
+    filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
+    
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    try:
+        # Get file info
+        stat = os.stat(filepath)
+        file_info = {
+            "filename": safe_filename,
+            "original_name": safe_filename.split('_', 2)[-1] if '_' in safe_filename else safe_filename,
+            "size": stat.st_size,
+            "upload_time": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            "file_hash": get_file_hash(filepath),
+            "mime_type": mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
+        }
+        
+        # Remove existing analysis from cache
+        if safe_filename in analysis_results:
+            del analysis_results[safe_filename]
+        
+        # Queue new analysis
+        background_tasks.add_task(process_image_analysis, filepath, safe_filename, file_info)
+        
+        logger.info(f"🔄 Re-analysis queued for: {safe_filename}")
+        return {
+            "status": "success", 
+            "message": f"Re-analysis queued for {safe_filename}",
+            "filename": safe_filename
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error re-analyzing file {filename}: {e}")
+        raise HTTPException(status_code=500, detail="Error queuing re-analysis")
+
+# -------------------------
+# 🚀 Main Execution
+# -------------------------
+if __name__ == "__main__":
+    try:
+        logger.info("🌟 Starting Enhanced Image Server with AI Analysis...")
+        logger.info(f"📁 Upload folder: {UPLOAD_FOLDER}")
+        logger.info(f"📊 Analysis folder: {ANALYSIS_FOLDER}")
+        logger.info(f"🔑 API Key configured: {'✅' if API_KEY else '❌'}")
+        logger.info(f"🤖 AI Model: {AI_MODEL}")
+        logger.info(f"📏 Max file size: {MAX_FILE_SIZE // (1024*1024)}MB")
+        logger.info(f"🎯 Allowed extensions: {', '.join(ALLOWED_EXTENSIONS)}")
+        
+        # Start ngrok tunnel in a separate thread
+        def start_ngrok():
+            try:
+                public_url = ngrok.connect(PORT)
+                logger.info(f"🌐 Public URL: {public_url}")
+                return public_url
+            except Exception as e:
+                logger.warning(f"⚠️ Ngrok failed to start: {e}")
+                return None
+        
+        # Start ngrok in background
+        ngrok_thread = threading.Thread(target=start_ngrok, daemon=True)
+        ngrok_thread.start()
+        
+        # Start the server
+        uvicorn.run(
+            app, 
+            host="0.0.0.0", 
+            port=PORT, 
+            log_level="info",
+            access_log=True
+        )
+        
+    except KeyboardInterrupt:
+        logger.info("🛑 Server stopped by user")
+    except Exception as e:
+        logger.error(f"❌ Server startup error: {e}")
+    finally:
+        try:
+            ngrok.disconnect_all()
+            logger.info("🔌 Ngrok disconnected")
+        except Exception:
+            pass
